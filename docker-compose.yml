@@ -1,0 +1,100 @@
+x-logging: &default-logging
+  driver: loki
+  options:
+    loki-url: 'http://localhost:3100/api/prom/push'
+    loki-pipeline-stages: |
+      - multiline:
+          firstline: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.\d{3}'
+          max_wait_time: 3s
+      - regex:
+          expression: '^(?P<date>\d{4}-\d{2}-\d{2}) (?P<time>\d{2}:\d{2}:\d{2}.\d{3}) (?P<message>(?s:.*))$$'
+
+version: "3.4"
+
+services:
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+
+  otel_collector:
+    image: otel/opentelemetry-collector-contrib
+    command: "--config /etc/config.yaml"
+    volumes:
+      - ./etc/otel/config.yaml:/etc/config.yaml
+
+    ports:
+      - "1888:1888"   # pprof extension
+      - "8888:8888"   # Prometheus metrics exposed by the collector
+      - "8889:8889"   # Prometheus exporter metrics
+      - "13133:13133" # health_check extension
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP http receiver
+      - "55679:55679" # zpages extension
+
+  # To eventually offload to Tempo...
+  tempo:
+    image: grafana/tempo:latest
+    command: [ "-config.file=/etc/tempo.yaml" ]
+    volumes:
+      - ./etc/tempo/tempo-local.yaml:/etc/tempo.yaml
+      - ./data/tempo-data:/tmp/tempo
+    ports:
+      - "3200"   # tempo
+      - "4317"  # otlp grpc
+      - "4318"  # otlp http
+    depends_on:
+      - loki
+      - otel_collector
+    logging: *default-logging
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - --config.file=/workspace/prometheus.yml
+      - --web.enable-remote-write-receiver
+      - --enable-feature=exemplar-storage
+    volumes:
+      - ./etc/prometheus:/workspace
+    ports:
+      - "9090:9090"
+    depends_on:
+      - loki
+      - otel_collector
+    logging: *default-logging
+
+
+  grafana:
+    image: grafana/grafana:9.3.0
+    volumes:
+      - ./etc/grafana/:/etc/grafana/provisioning/datasources
+      - ./etc/dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml
+      - ./etc/dashboards:/etc/grafana/dashboards
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=tempoSearch tempoBackendSearch tempoServiceGraph
+    ports:
+      - "3000:3000"
+    depends_on:
+      - loki
+      - otel_collector
+      - prometheus
+    logging: *default-logging
+
+
+  middleware-svc:
+    build: ./demo-app/middleware/
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel_collector:4317
+      - OTEL_RESOURCE_ATTRIBUTES=service.name=middleware-svc,compose_service=middleware-svc
+      - OTEL_METRICS_EXPORTER=none
+      - MANAGEMENT_METRICS_TAGS_APPLICATION=middleware-svc
+    ports:
+      - "8080:8080"
+    logging: *default-logging
+    depends_on:
+      - loki
+      - otel_collector
